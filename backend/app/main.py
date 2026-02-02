@@ -2,8 +2,9 @@ import os
 import shutil
 import json
 import math
-import random # <--- Added for random feedback
-import soundfile as sf
+import random
+import asyncio
+import edge_tts  # <--- NEW VOICE ENGINE
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -14,49 +15,48 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from kokoro import KPipeline 
 
+# --- SETUP ---
 load_dotenv()
 app = FastAPI()
 
-# --- CONFIG ---
 PDF_FILE_PATH = "data/acl-protocol.pdf"
 USER_DATA_PATH = "user_data.json"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# --- COACHING DATABASE ---
+# --- 1. VOICE SETTINGS (The "Pro" Vibe) ---
+# "en-US-AriaNeural" is the best free 'Doctor' voice available.
+VOICE_NAME = "en-US-AriaNeural" 
+
+# --- 2. COACHING PHRASES (Instant Responses) ---
 COACH_PHRASES = {
     "start_squat": [
         "Alright, let's aim for 10 reps. Feet shoulder-width apart. Go.",
         "Position looks good. Give me 10 clean squats. Start when ready.",
-        "Okay, Protocol Week {week}. Target depth is {depth} degrees. Let's go."
+        "Okay, Protocol Week {week}. Target depth is {depth} degrees. Let's work."
     ],
     "good_rep": [
         "Perfect.", "Nice control.", "That's it.", "Good form.", "Solid.", "Excellent."
     ],
     "correction_lower": [
-        "Go a bit deeper...", "Not quite there, lower...", "Push for that depth...", "Lower..."
-    ],
-    "correction_posture": [
-        "Keep your chest up.", "Control the descent.", "Don't rush it."
+        "Go a bit deeper.", "Not quite there, lower.", "Push for that depth.", "Lower."
     ],
     "complete": [
         "And rest. Great set.", "Target hit. Good work today.", "Relax. You crushed it."
     ]
 }
 
-# --- PROTOCOL RULES ---
+# --- 3. MEDICAL PROTOCOLS ---
 PROTOCOL_RULES = {
-    1: {"max_flexion": 90, "squat_depth": 110, "target_reps": 8, "exercises": ["heel_slide", "leg_raise"]},
-    2: {"max_flexion": 100, "squat_depth": 100, "target_reps": 10, "exercises": ["squat"]},
-    3: {"max_flexion": 115, "squat_depth": 90, "target_reps": 12, "exercises": ["squat"]},
+    1: {"max_flexion": 90, "squat_depth": 110, "target_reps": 8},
+    2: {"max_flexion": 100, "squat_depth": 100, "target_reps": 10},
+    3: {"max_flexion": 115, "squat_depth": 90, "target_reps": 12},
 }
 
 # --- GLOBALS ---
 vector_store = None
 groq_client = None
 llm = None
-tts_pipeline = None 
 
 # --- SESSION STATE ---
 current_session = {
@@ -64,19 +64,20 @@ current_session = {
     "is_active": False,        
     "reps_session": 0,
     "target_reps": 10,
-    "feedback_buffer": "" # Stores "Go Lower" so we don't say it 10 times a second
+    "feedback_buffer": "",
+    "last_response": "" # For Echo Cancellation
 }
 
 @app.on_event("startup")
 def startup_event():
-    global vector_store, groq_client, llm, tts_pipeline
-    print("⚡ Initializing Dr. Kineti (Coach Persona)...")
-    tts_pipeline = KPipeline(lang_code='a') 
+    global vector_store, groq_client, llm
+    print("⚡ Initializing Kineti-AI (Pro Voice + Hybrid Brain)...")
     
     if GROQ_API_KEY:
         groq_client = Groq(api_key=GROQ_API_KEY)
         llm = ChatGroq(groq_api_key=GROQ_API_KEY, model_name="llama-3.1-8b-instant", temperature=0.2)
     
+    # Load Medical Knowledge (RAG)
     if os.path.exists(PDF_FILE_PATH):
         embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
         loader = PyPDFLoader(PDF_FILE_PATH)
@@ -85,8 +86,10 @@ def startup_event():
         splits = text_splitter.split_documents(docs)
         vector_store = FAISS.from_documents(splits, embeddings)
         print("✅ Brain Ready.")
+    else:
+        print("⚠️ Warning: PDF not found. RAG disabled.")
 
-# --- MEMORY FUNCTIONS ---
+# --- HELPER FUNCTIONS ---
 def load_history():
     if not os.path.exists(USER_DATA_PATH): return {"current_week": 1, "total_reps": 0}
     with open(USER_DATA_PATH, "r") as f: return json.load(f)
@@ -94,7 +97,6 @@ def load_history():
 def save_history(data):
     with open(USER_DATA_PATH, "w") as f: json.dump(data, f, indent=4)
 
-# --- MATH TOOLKIT ---
 def calculate_angle(p1, p2, p3):
     ax, ay, az = p1['x']-p2['x'], p1['y']-p2['y'], p1['z']-p2['z']
     bx, by, bz = p3['x']-p2['x'], p3['y']-p2['y'], p3['z']-p2['z']
@@ -104,128 +106,127 @@ def calculate_angle(p1, p2, p3):
     if mag_a * mag_b == 0: return 180.0
     return math.degrees(math.acos(max(-1.0, min(1.0, dot_product / (mag_a * mag_b)))))
 
-# --- EXERCISE ANALYZERS ---
-def analyze_squat(joints, week_data):
-    target_depth = week_data["squat_depth"]
-    target_reps = week_data.get("target_reps", 10)
-    angle = calculate_angle(joints['RightHip'], joints['RightKnee'], joints['RightAnkle'])
-    
-    print(f"📐 Angle: {int(angle)}° | Target: <{target_depth}")
-
-    # 1. COACHING: Going Down
-    if angle < target_depth: 
-        if not current_session["is_active"]:
-            current_session["is_active"] = True
-            return "Good depth. Up." 
-    elif angle < (target_depth + 15) and not current_session["is_active"]:
-        # They are CLOSE but not deep enough yet
-        return random.choice(COACH_PHRASES["correction_lower"])
-
-    # 2. COACHING: Standing Up (Rep Complete)
-    elif angle > 160: 
-        if current_session["is_active"]:
-            current_session["is_active"] = False
-            current_session["reps_session"] += 1
-            
-            reps = current_session["reps_session"]
-            
-            # Check for Set Completion
-            if reps >= target_reps:
-                return random.choice(COACH_PHRASES["complete"])
-            
-            # Random Encouragement every few reps
-            phrase = random.choice(COACH_PHRASES["good_rep"])
-            return f"{phrase} That is {reps}."
-            
-    return None
-
+# --- CORE LOGIC: THE MOVEMENT ANALYZER ---
 def analyze_movement(skeleton_json):
     global current_session
     try:
         data = json.loads(skeleton_json)
         if "joints" not in data or len(data["joints"]) == 0: return None
+        
+        # Convert list to dict for easier access
         joints = {j['name']: j for j in data['joints']}
-        if 'RightKnee' not in joints: return None
         
-        hist = load_history()
-        week = hist.get("current_week", 1)
-        rules = PROTOCOL_RULES.get(week, PROTOCOL_RULES[1])
-        
-        mode = current_session["active_exercise"]
-        
-        rep_msg = None
-        if mode == "squat": rep_msg = analyze_squat(joints, rules)
-        
-        if rep_msg:
-             # Logic to prevent spamming "Go Lower" every millisecond
-             if rep_msg in COACH_PHRASES["correction_lower"]:
-                 if current_session["feedback_buffer"] == rep_msg: return None # Don't repeat immediately
-                 current_session["feedback_buffer"] = rep_msg
-             else:
-                 current_session["feedback_buffer"] = "" # Reset on new event
-                 
-             if any(char.isdigit() for char in rep_msg): # If it counts a rep
-                 hist["total_reps"] += 1
-                 save_history(hist)
-                 
-        return rep_msg
+        # Start Exercise Check (If user says "Squats", we look for squat motion)
+        if current_session["active_exercise"] == "squat" and 'RightKnee' in joints:
+            
+            # Load Rules
+            hist = load_history()
+            week = hist.get("current_week", 1)
+            rules = PROTOCOL_RULES.get(week, PROTOCOL_RULES[1])
+            target_depth = rules["squat_depth"]
+            
+            # Calculate Angle
+            angle = calculate_angle(joints['RightHip'], joints['RightKnee'], joints['RightAnkle'])
+            
+            # Logic: Down Phase
+            if angle < target_depth: 
+                if not current_session["is_active"]:
+                    current_session["is_active"] = True
+                    return "Good depth. Up." 
+            elif angle < (target_depth + 15) and not current_session["is_active"]:
+                 # Don't spam "Lower" every frame
+                 if current_session["feedback_buffer"] != "lower":
+                     current_session["feedback_buffer"] = "lower"
+                     return random.choice(COACH_PHRASES["correction_lower"])
 
+            # Logic: Up Phase (Rep Complete)
+            elif angle > 160: 
+                if current_session["is_active"]:
+                    current_session["is_active"] = False
+                    current_session["reps_session"] += 1
+                    reps = current_session["reps_session"]
+                    
+                    # Update History File
+                    hist["total_reps"] += 1
+                    save_history(hist)
+                    
+                    if reps >= rules["target_reps"]: 
+                        return random.choice(COACH_PHRASES["complete"])
+                    
+                    # Hybrid Response: "Good form. 5."
+                    phrase = random.choice(COACH_PHRASES["good_rep"])
+                    return f"{phrase} {reps}."
+            
+        return None
     except Exception as e:
         print(f"⚠️ Math Error: {e}")
         return None
 
-# --- VOICE ---
-def generate_local_voice(text, output_file):
+# --- NEW VOICE FUNCTION ---
+async def generate_pro_voice(text, output_file):
     try:
-        # Sarah is the best "Coach" voice
-        generator = tts_pipeline(text, voice='af_sarah', speed=1.2)
-        all_audio = []
-        for _, _, audio in generator: all_audio.extend(audio)
-        sf.write(output_file, all_audio, 24000)
+        communicate = edge_tts.Communicate(text, VOICE_NAME)
+        await communicate.save(output_file)
         return True
-    except Exception as e: return False
+    except Exception as e:
+        print(f"❌ Voice Generation Error: {e}")
+        return False
 
+# --- DECISION ENGINE ---
 def get_ai_decision(user_text, skeleton_data):
+    # 1. Check Movement FIRST (Fastest)
     rep_msg = analyze_movement(skeleton_data)
-    if rep_msg: return rep_msg, "none" # Priority: Physical Feedback
+    if rep_msg: return rep_msg, "none"
 
+    # 2. Check Key Commands
     history = load_history()
     week = history.get("current_week", 1)
-    rules = PROTOCOL_RULES.get(week, PROTOCOL_RULES[1])
-
-    # TRIGGER EXERCISE MODE
+    
     if "squat" in user_text.lower():
         current_session["active_exercise"] = "squat"
         current_session["reps_session"] = 0
-        depth = rules["squat_depth"]
-        # Pick a random start phrase
+        depth = PROTOCOL_RULES[week]["squat_depth"]
         start_phrase = random.choice(COACH_PHRASES["start_squat"]).format(week=week, depth=depth)
-        return start_phrase, "squat"
+        return start_phrase, "squat" # Sends "squat" image command
 
-    # DEFAULT CHAT
+    # 3. Ask the Doctor (LLM)
     if not vector_store: return "I am ready.", "none"
+    
     retriever = vector_store.as_retriever(search_kwargs={"k": 1})
     docs = retriever.invoke(user_text)
     context = docs[0].page_content[:600]
-    messages = [("system", f"Context: {context}. You are Dr. Kineti. Brief advice."), ("human", user_text)]
-    return llm.invoke(messages).content, "none"
+    
+    system_prompt = f"""
+    You are Dr. Kineti, a strict but encouraging AI Physical Therapist.
+    Context from medical protocol: {context}
+    User History: Week {week}.
+    Answer briefly (under 2 sentences).
+    """
+    
+    messages = [("system", system_prompt), ("human", user_text)]
+    response = llm.invoke(messages).content
+    return response, "none"
 
 # --- ENDPOINTS ---
 class TextRequest(BaseModel):
     text: str
 
 @app.post("/speak")
-def speak(request: TextRequest):
+async def speak(request: TextRequest):
+    # Used for the greeting at app startup
     output = "greeting.mp3"
-    if generate_local_voice("Hello. Dr. Kineti here.", output):
+    text = "Welcome back to Kineti AI. I am ready to start."
+    if await generate_pro_voice(text, output):
         return FileResponse(output, media_type="audio/mpeg", filename="greeting.mp3")
-    raise HTTPException(status_code=500, detail="Audio failed")
+    raise HTTPException(status_code=500, detail="Voice failed")
 
 @app.post("/talk")
-def talk(file: UploadFile = File(...), skeleton_data: str = Form(...)):
+async def talk(file: UploadFile = File(...), skeleton_data: str = Form(...)):
     temp_in = f"temp_{file.filename}"
     output = "response.mp3"
+    
     try:
+        # Save audio
         with open(temp_in, "wb") as buffer: shutil.copyfileobj(file.file, buffer)
         
         # 1. Transcribe
@@ -236,31 +237,50 @@ def talk(file: UploadFile = File(...), skeleton_data: str = Form(...)):
         user_text = transcription.text.strip()
         print(f"🗣️ User: {user_text}")
 
-        # 2. Analyze
+        # --- ECHO SAFETY CHECK ---
+        # If user text matches the last thing AI said, ignore it.
+        last_resp = current_session.get("last_response", "").lower()
+        if len(user_text) > 5 and (user_text.lower() in last_resp or last_resp in user_text.lower()):
+             print("⚠️ Echo detected. Ignoring.")
+             return JSONResponse(content={"status": "echo_ignored"}, status_code=200)
+
+        # 2. Movement Logic (Zero Lag)
         rep_msg = analyze_movement(skeleton_data)
         
-        headers = {"X-Image-Cmd": "none", "X-Feedback": ""}
+        headers = {
+            "X-Image-Cmd": "none", 
+            "X-Feedback": "", 
+            "X-Rep-Count": str(current_session["reps_session"])
+        }
 
-        # Priority: Movement Feedback (Even if silent)
+        # Priority A: Movement Feedback (Fastest)
         if rep_msg:
             print(f"🏋️ Coach: {rep_msg}")
-            headers["X-Feedback"] = rep_msg # Send text to Unity Screen
-            if any(char.isdigit() for char in rep_msg): # If it contains a number, it's a rep count
-                 # Extract number roughly for the big counter (simple logic)
-                 headers["X-Rep-Count"] = ''.join(filter(str.isdigit, rep_msg))
+            headers["X-Feedback"] = rep_msg
+            if await generate_pro_voice(rep_msg, output):
+                return FileResponse(output, media_type="audio/mpeg", headers=headers)
 
-            if generate_local_voice(rep_msg, output):
-                return FileResponse(output, media_type="audio/mpeg", filename="response.mp3", headers=headers)
+        # Silent if no input and no movement
+        if len(user_text) < 2: 
+            return JSONResponse(content={"status": "silent"}, status_code=200)
 
-        if len(user_text) < 2: return JSONResponse(content={"status": "silent"}, status_code=200)
-
-        # Normal Chat
+        # Priority B: AI Conversation
         ai_text, image_cmd = get_ai_decision(user_text, skeleton_data)
+        
+        # Store response for next echo check
+        current_session["last_response"] = ai_text 
+        
         headers["X-Image-Cmd"] = image_cmd
-        headers["X-Feedback"] = ai_text[:50] + "..." # Show snippet on screen
+        headers["X-Feedback"] = "Listening..." # Clear feedback when chatting
 
-        if generate_local_voice(ai_text, output):
-            return FileResponse(output, media_type="audio/mpeg", filename="response.mp3", headers=headers)
-        else: raise HTTPException(status_code=500, detail="Gen Failed")
+        print(f"🤖 Dr. Kineti: {ai_text}")
+        
+        if await generate_pro_voice(ai_text, output):
+            return FileResponse(output, media_type="audio/mpeg", headers=headers)
+        
+        raise HTTPException(status_code=500, detail="Gen Failed")
+
     finally:
         if os.path.exists(temp_in): os.remove(temp_in)
+
+# Run with: python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
