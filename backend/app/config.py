@@ -4,9 +4,9 @@ Constants, environment variables, and global state.
 """
 
 import os
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
-load_dotenv()
+load_dotenv(find_dotenv())
 
 # --- API Keys ---
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
