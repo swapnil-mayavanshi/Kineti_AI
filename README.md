@@ -5,10 +5,10 @@ KinetiAI is an interactive, voice-driven, and vision-enabled AI assistant design
 
 ## ✨ Key Features
 * **🗣️ Hands-Free Voice Interaction:** Completely voice-driven interface using Groq's Whisper for speech-to-text and Edge-TTS for low-latency, natural voice generation.
-* **👁️ Real-Time Vision Tracking:** Analyzes user biomechanics using AR skeleton data. It calculates joint angles (e.g., knee flexion) dynamically and tracks repetitions only when perfect form is achieved.
-* **🧠 Clinical RAG Brain:** Integrates a Retrieval-Augmented Generation (RAG) system loaded with ACL rehabilitation protocols to ensure the AI's exercise recommendations and target angles are medically safe.
-* **🔄 Smart Session Management:** Uses a rigid state machine (`Check-in` ➡️ `Propose Exercise` ➡️ `Active Workout`) to prevent premature workouts and ensure the user is physically ready.
-* **🔇 Smart Echo Cancellation:** Custom `difflib`-based audio filtering prevents the AI from hearing its own voice through the user's microphone.
+* **👁️ Real-Time Low Latency Vision Tracking:** Analyzes user biomechanics using AR skeleton data with a hyper-fast 0.15s polling rate. It calculates joint angles (e.g., knee flexion) dynamically and calculates repetitions.
+* **🧠 Clinical RAG Brain (Personalized):** Integrates a Retrieval-Augmented Generation (RAG) system loaded with ACL rehabilitation protocols. The AI agent retains conversational memory (persisted via `user_data.json`) to personalize the therapy based on past completed workouts and progress.
+* **🔄 Smart Session Management:** Uses a rigid state machine (`check_in` ➡️ `propose_exercise` ➡️ `active_workout` ➡️ `finished_workout`) to prevent premature workouts, ensure the user is physically ready, and provide post-workout performance summaries.
+* **🔇 Smart Echo Cancellation:** Custom `difflib` and time-based audio filtering prevents the AI from hearing its own voice through the user's microphone.
 
 ## 🛠️ Tech Stack
 
