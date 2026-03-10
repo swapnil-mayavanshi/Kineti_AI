@@ -71,9 +71,48 @@ def is_echo(user_text, last_text):
 
 
 async def synthesize_speech(text, output_path="response.mp3"):
-    """Generate TTS audio file from text using Edge-TTS."""
+    """Generate TTS audio file from text using Sarvam AI."""
     record_ai_response(text)  # Track for echo suppression
-    communicate = edge_tts.Communicate(text, VOICE_NAME)
-    await communicate.save(output_path)
-    return output_path
+    import requests
+    import base64
+    from app.config import SARVAM_API_KEY
+
+    url = "https://api.sarvam.ai/text-to-speech"
+    
+    payload = {
+        "inputs": [text],
+        "target_language_code": "hi-IN",
+        "speaker": "abhilash",
+        "speech_sample_rate": 8000
+    }
+
+    headers = {
+        "api-subscription-key": SARVAM_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    try:
+        # Run synchronous requests call in a thread pool to avoid blocking async event loop
+        import asyncio
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, lambda: requests.post(url, json=payload, headers=headers))
+        
+        if response.status_code == 200:
+            data = response.json()
+            if "audios" in data and len(data["audios"]) > 0:
+                audio_base64 = data["audios"][0]
+                audio_bytes = base64.b64decode(audio_base64)
+                with open(output_path, "wb") as f:
+                    f.write(audio_bytes)
+                print("🔊 Sarvam TTS generated successfully")
+                return output_path
+            else:
+                print(f"⚠️ Sarvam API responded but 'audios' key missing: {data}")
+        else:
+            print(f"⚠️ Sarvam API Error {response.status_code}: {response.text}")
+
+    except Exception as e:
+        print(f"⚠️ Sarvam request failed: {e}")
+        
+    return None
 

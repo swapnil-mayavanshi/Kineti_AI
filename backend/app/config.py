@@ -10,6 +10,7 @@ load_dotenv()
 
 # --- API Keys ---
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
 
 # --- File Paths ---
 PDF_FILE_PATH = "data/acl-protocol.pdf"
