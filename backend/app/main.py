@@ -1,286 +1,403 @@
+"""
+Kineti-AI — Main Application
+FastAPI app setup and endpoint definitions.
+All business logic is in separate modules.
+"""
+
 import os
 import shutil
-import json
-import math
-import random
-import asyncio
-import edge_tts  # <--- NEW VOICE ENGINE
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+import base64
+
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
-from dotenv import load_dotenv
-from groq import Groq
-from langchain_groq import ChatGroq
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# --- SETUP ---
-load_dotenv()
+from app.config import GROQ_API_KEY, PDF_FILE_PATH, SYSTEM_INSTRUCTION, VOICE_NAME, MIN_AUDIO_SIZE_BYTES
+from app import config
+from app.models import TextRequest
+from app import session
+from app.pose_engine import detect_pose_from_frame, process_vision_data
+from app.voice_engine import is_echo, synthesize_speech
+from app.conversation import manage_conversation
+
+# --- App ---
 app = FastAPI()
+_vision_count = 0
+_debug_poses = []  # Store last 5 poses for debugging
 
-PDF_FILE_PATH = "data/acl-protocol.pdf"
-USER_DATA_PATH = "user_data.json"
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# --- 1. VOICE SETTINGS (The "Pro" Vibe) ---
-# "en-US-AriaNeural" is the best free 'Doctor' voice available.
-VOICE_NAME = "en-US-AriaNeural" 
+# --- DEBUG ENDPOINT ---
+@app.get("/debug")
+def debug():
+    """Returns last 5 detected pose snapshots so you can verify coordinates change."""
+    cs = session.current_session
+    return {
+        "session_state": cs["state"],
+        "reps_count": cs["reps_count"],
+        "is_moving": cs["is_moving"],
+        "form_status": cs.get("form_status", "neutral"),
+        "current_angle": round(cs.get("current_angle", 180), 1),
+        "last_poses_count": len(_debug_poses),
+        "last_poses": _debug_poses[-5:]  # Last 5 snapshots
+    }
 
-# --- 2. COACHING PHRASES (Instant Responses) ---
-COACH_PHRASES = {
-    "start_squat": [
-        "Alright, let's aim for 10 reps. Feet shoulder-width apart. Go.",
-        "Position looks good. Give me 10 clean squats. Start when ready.",
-        "Okay, Protocol Week {week}. Target depth is {depth} degrees. Let's work."
-    ],
-    "good_rep": [
-        "Perfect.", "Nice control.", "That's it.", "Good form.", "Solid.", "Excellent."
-    ],
-    "correction_lower": [
-        "Go a bit deeper.", "Not quite there, lower.", "Push for that depth.", "Lower."
-    ],
-    "complete": [
-        "And rest. Great set.", "Target hit. Good work today.", "Relax. You crushed it."
-    ]
-}
 
-# --- 3. MEDICAL PROTOCOLS ---
-PROTOCOL_RULES = {
-    1: {"max_flexion": 90, "squat_depth": 110, "target_reps": 8},
-    2: {"max_flexion": 100, "squat_depth": 100, "target_reps": 10},
-    3: {"max_flexion": 115, "squat_depth": 90, "target_reps": 12},
-}
+# --- CONNECTIVITY TEST ---
+@app.get("/ping")
+def ping():
+    """Simple connectivity test — visit http://YOUR_IP:8000/ping from phone browser."""
+    return {"status": "ok", "message": "Kineti-AI server is reachable!"}
 
-# --- GLOBALS ---
-vector_store = None
-groq_client = None
-llm = None
 
-# --- SESSION STATE ---
-current_session = {
-    "active_exercise": "none", 
-    "is_active": False,        
-    "reps_session": 0,
-    "target_reps": 10,
-    "feedback_buffer": "",
-    "last_response": "" # For Echo Cancellation
-}
+@app.get("/status")
+def status():
+    """Server status check."""
+    return {
+        "server": "running",
+        "groq": config.groq_client is not None,
+        "rag": config.vector_store is not None,
+        "session_state": session.current_session["state"]
+    }
 
+
+# --- 1. INITIALIZATION ---
 @app.on_event("startup")
 def startup_event():
-    global vector_store, groq_client, llm
-    print("⚡ Initializing Kineti-AI (Pro Voice + Hybrid Brain)...")
-    
+    print("⚡ Initializing Kineti-AI (Optimized Backend)...")
+
+    # 1. Setup Groq
     if GROQ_API_KEY:
-        groq_client = Groq(api_key=GROQ_API_KEY)
-        llm = ChatGroq(groq_api_key=GROQ_API_KEY, model_name="llama-3.1-8b-instant", temperature=0.2)
-    
-    # Load Medical Knowledge (RAG)
+        from groq import Groq
+        config.groq_client = Groq(api_key=GROQ_API_KEY)
+
+        # Import ChatGroq — resolve Pydantic v2 forward-ref issues
+        # by importing all required types before instantiation
+        from langchain_core.caches import BaseCache  # noqa: F401
+        from langchain_core.callbacks import Callbacks  # noqa: F401
+        from langchain_groq import ChatGroq
+        ChatGroq.model_rebuild()
+        config.llm = ChatGroq(groq_api_key=GROQ_API_KEY, model_name="llama-3.1-8b-instant", temperature=0.1)
+
+    # 2. Setup RAG
     if os.path.exists(PDF_FILE_PATH):
-        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-        loader = PyPDFLoader(PDF_FILE_PATH)
-        docs = loader.load()
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
-        splits = text_splitter.split_documents(docs)
-        vector_store = FAISS.from_documents(splits, embeddings)
-        print("✅ Brain Ready.")
+        print(f"📚 Loading PDF Brain: {PDF_FILE_PATH}...")
+        try:
+            from langchain_huggingface import HuggingFaceEmbeddings
+            from langchain_community.vectorstores import FAISS
+            from langchain_community.document_loaders import PyPDFLoader
+            from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+            embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+            loader = PyPDFLoader(PDF_FILE_PATH)
+            docs = loader.load()
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+            splits = text_splitter.split_documents(docs)
+            config.vector_store = FAISS.from_documents(splits, embeddings)
+            print("✅ Brain Ready.")
+        except Exception as e:
+            print(f"⚠️ RAG Load Failed: {e}")
     else:
         print("⚠️ Warning: PDF not found. RAG disabled.")
 
-# --- HELPER FUNCTIONS ---
-def load_history():
-    if not os.path.exists(USER_DATA_PATH): return {"current_week": 1, "total_reps": 0}
-    with open(USER_DATA_PATH, "r") as f: return json.load(f)
 
-def save_history(data):
-    with open(USER_DATA_PATH, "w") as f: json.dump(data, f, indent=4)
+# --- 2. ENDPOINTS ---
 
-def calculate_angle(p1, p2, p3):
-    ax, ay, az = p1['x']-p2['x'], p1['y']-p2['y'], p1['z']-p2['z']
-    bx, by, bz = p3['x']-p2['x'], p3['y']-p2['y'], p3['z']-p2['z']
-    dot_product = ax*bx + ay*by + az*bz
-    mag_a = math.sqrt(ax**2 + ay**2 + az**2)
-    mag_b = math.sqrt(bx**2 + by**2 + bz**2)
-    if mag_a * mag_b == 0: return 180.0
-    return math.degrees(math.acos(max(-1.0, min(1.0, dot_product / (mag_a * mag_b)))))
+@app.get("/start_workout")
+def start_workout():
+    """Quick-start workout mode — enables rep counting and form analysis immediately."""
+    cs = session.current_session
+    cs["state"] = "active_workout"
+    cs["reps_count"] = 0
+    cs["is_moving"] = False
+    cs["form_status"] = "neutral"
+    cs["current_angle"] = 180
+    print("🏋️ Workout quick-started via /start_workout")
+    return {"status": "workout_started", "message": "Rep counting and form analysis are now active!"}
 
-# --- CORE LOGIC: THE MOVEMENT ANALYZER ---
-def analyze_movement(skeleton_json):
-    global current_session
-    try:
-        data = json.loads(skeleton_json)
-        if "joints" not in data or len(data["joints"]) == 0: return None
-        
-        # Convert list to dict for easier access
-        joints = {j['name']: j for j in data['joints']}
-        
-        # Start Exercise Check (If user says "Squats", we look for squat motion)
-        if current_session["active_exercise"] == "squat" and 'RightKnee' in joints:
-            
-            # Load Rules
-            hist = load_history()
-            week = hist.get("current_week", 1)
-            rules = PROTOCOL_RULES.get(week, PROTOCOL_RULES[1])
-            target_depth = rules["squat_depth"]
-            
-            # Calculate Angle
-            angle = calculate_angle(joints['RightHip'], joints['RightKnee'], joints['RightAnkle'])
-            
-            # Logic: Down Phase
-            if angle < target_depth: 
-                if not current_session["is_active"]:
-                    current_session["is_active"] = True
-                    return "Good depth. Up." 
-            elif angle < (target_depth + 15) and not current_session["is_active"]:
-                 # Don't spam "Lower" every frame
-                 if current_session["feedback_buffer"] != "lower":
-                     current_session["feedback_buffer"] = "lower"
-                     return random.choice(COACH_PHRASES["correction_lower"])
 
-            # Logic: Up Phase (Rep Complete)
-            elif angle > 160: 
-                if current_session["is_active"]:
-                    current_session["is_active"] = False
-                    current_session["reps_session"] += 1
-                    reps = current_session["reps_session"]
-                    
-                    # Update History File
-                    hist["total_reps"] += 1
-                    save_history(hist)
-                    
-                    if reps >= rules["target_reps"]: 
-                        return random.choice(COACH_PHRASES["complete"])
-                    
-                    # Hybrid Response: "Good form. 5."
-                    phrase = random.choice(COACH_PHRASES["good_rep"])
-                    return f"{phrase} {reps}."
-            
-        return None
-    except Exception as e:
-        print(f"⚠️ Math Error: {e}")
-        return None
-
-# --- NEW VOICE FUNCTION ---
-async def generate_pro_voice(text, output_file):
-    try:
-        communicate = edge_tts.Communicate(text, VOICE_NAME)
-        await communicate.save(output_file)
-        return True
-    except Exception as e:
-        print(f"❌ Voice Generation Error: {e}")
-        return False
-
-# --- DECISION ENGINE ---
-def get_ai_decision(user_text, skeleton_data):
-    # 1. Check Movement FIRST (Fastest)
-    rep_msg = analyze_movement(skeleton_data)
-    if rep_msg: return rep_msg, "none"
-
-    # 2. Check Key Commands
-    history = load_history()
-    week = history.get("current_week", 1)
-    
-    if "squat" in user_text.lower():
-        current_session["active_exercise"] = "squat"
-        current_session["reps_session"] = 0
-        depth = PROTOCOL_RULES[week]["squat_depth"]
-        start_phrase = random.choice(COACH_PHRASES["start_squat"]).format(week=week, depth=depth)
-        return start_phrase, "squat" # Sends "squat" image command
-
-    # 3. Ask the Doctor (LLM)
-    if not vector_store: return "I am ready.", "none"
-    
-    retriever = vector_store.as_retriever(search_kwargs={"k": 1})
-    docs = retriever.invoke(user_text)
-    context = docs[0].page_content[:600]
-    
-    system_prompt = f"""
-    You are Dr. Kineti, a strict but encouraging AI Physical Therapist.
-    Context from medical protocol: {context}
-    User History: Week {week}.
-    Answer briefly (under 2 sentences).
+@app.post("/vision")
+async def vision(
+    camera_frame_b64: str = Form(""),
+    rotation: str = Form("0"),
+    mirrored: str = Form("0")
+):
     """
-    
-    messages = [("system", system_prompt), ("human", user_text)]
-    response = llm.invoke(messages).content
-    return response, "none"
+    Lightweight vision-only endpoint — no audio processing.
+    Receives camera frame + rotation info, returns landmarks + pose status.
+    """
+    global _vision_count
+    _vision_count += 1
+    cs = session.current_session
+    response_data = {
+        "landmarks": "{}",
+        "pose_detected": False,
+        "form_status": cs.get("form_status", "neutral"),
+        "angle": round(cs.get("current_angle", 180), 1),
+        "rep_count": cs["reps_count"],
+        "feedback": ""
+    }
 
-# --- ENDPOINTS ---
-class TextRequest(BaseModel):
-    text: str
+    if camera_frame_b64 and len(camera_frame_b64) > 100:
+        try:
+            frame_bytes = base64.b64decode(camera_frame_b64)
+            rot_angle = int(rotation)
+            is_mirrored = (mirrored == "1")
+            result = detect_pose_from_frame(frame_bytes, rot_angle, is_mirrored)
+            if isinstance(result, tuple):
+                skeleton_data, unity_landmarks = result
+                if unity_landmarks != "{}":
+                    response_data["landmarks"] = unity_landmarks
+                    response_data["pose_detected"] = True
+
+                    # DEBUG: Save snapshot of key joint positions
+                    import json as _json
+                    try:
+                        _lm = _json.loads(unity_landmarks)
+                        _snapshot = {"frame": _vision_count}
+                        for j in _lm.get("joints", []):
+                            if j["name"] in ("Nose", "RightWrist", "RightKnee"):
+                                _snapshot[j["name"]] = {"x": j["x"], "y": j["y"]}
+                        _debug_poses.append(_snapshot)
+                        if len(_debug_poses) > 20:
+                            _debug_poses.pop(0)
+                        # Print EVERY frame coordinates
+                        nose = _snapshot.get("Nose", {})
+                        wrist = _snapshot.get("RightWrist", {})
+                        knee = _snapshot.get("RightKnee", {})
+                        print(f"🔍 F{_vision_count} Nose=({nose.get('x','?')},{nose.get('y','?')}) Wrist=({wrist.get('x','?')},{wrist.get('y','?')}) Knee=({knee.get('x','?')},{knee.get('y','?')})")
+                    except Exception:
+                        pass
+
+                    # Process vision for exercise tracking (if in workout)
+                    if not cs.get("paused_for_voice", False):
+                        vision_feedback = process_vision_data(skeleton_data)
+                        if vision_feedback:
+                            response_data["feedback"] = vision_feedback
+
+                    response_data["form_status"] = cs.get("form_status", "neutral")
+                    response_data["angle"] = round(cs.get("current_angle", 180), 1)
+                    response_data["rep_count"] = cs["reps_count"]
+        except Exception as e:
+            print(f"⚠️ Vision error: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # Debug: log response occasionally
+    if response_data["pose_detected"]:
+        angle = response_data.get("angle", 180)
+        form = response_data.get("form_status", "?")
+        reps = response_data.get("rep_count", 0)
+        fb = response_data.get("feedback", "")
+        if _vision_count % 5 == 0 or fb:  # ALWAYS log when feedback is given
+            print(f"📤 angle={angle}° form={form} reps={reps} fb='{fb}'")
+
+    return JSONResponse(content=response_data)
+
 
 @app.post("/speak")
 async def speak(request: TextRequest):
-    # Used for the greeting at app startup
+    """Initial greeting trigger."""
+    import json
+    import os
+    
+    # Try to load user name
+    user_name = "there"
+    try:
+        user_data_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "user_data.json")
+        if os.path.exists(user_data_path):
+            with open(user_data_path, 'r') as f:
+                user_data = json.load(f)
+                user_name = user_data.get("user_name", "there")
+    except Exception as e:
+        print(f"⚠️ Could not load user name for greeting: {e}")
+
     output = "greeting.mp3"
-    text = "Welcome back to Kineti AI. I am ready to start."
-    if await generate_pro_voice(text, output):
-        return FileResponse(output, media_type="audio/mpeg", filename="greeting.mp3")
-    raise HTTPException(status_code=500, detail="Voice failed")
+    session.current_session["state"] = "check_in"
+    text = f"Hello {user_name}! Dr. Kineti here. How are you feeling today?"
+    session.current_session["last_response"] = text
+    await synthesize_speech(text, output)
+    return FileResponse(output, media_type="audio/mpeg", filename="greeting.mp3")
+
+
+@app.post("/stop_workout")
+async def stop_workout():
+    """Manual trigger to stop the current workout and get a summary."""
+    cs = session.current_session
+    output = "summary.mp3"
+    
+    reps = cs.get("reps_count", 0)
+    exercise = cs.get("active_exercise", "Squats")
+    
+    # Update state
+    cs["state"] = "finished_workout"
+    cs["user_confirmed"] = False
+    
+    # Save progress
+    from app.conversation import get_user_context
+    import json, os
+    user_data = get_user_context()
+    user_data["reps_today"] = user_data.get("reps_today", 0) + reps
+    user_data["last_exercise"] = exercise
+    try:
+        user_data_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "user_data.json")
+        with open(user_data_path, 'w') as f:
+            json.dump(user_data, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ Failed to save user data on stop_workout: {e}")
+
+    # Generate summary speech
+    if reps > 0:
+        text = f"Workout complete! Excellent job, Swapnil. You finished {reps} {exercise}. Your progress has been saved. Take a rest, and let me know if you want to go again."
+    else:
+        text = "Workout stopped. Take a breather, Swapnil. Let me know when you're ready to try again."
+        
+    cs["last_response"] = text
+    await synthesize_speech(text, output)
+    
+    import base64
+    with open(output, "rb") as f:
+        audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+        
+    return JSONResponse(content={
+        "status": "workout_stopped", 
+        "feedback": text,
+        "reps": reps,
+        "audio_b64": audio_b64
+    })
+
 
 @app.post("/talk")
-async def talk(file: UploadFile = File(...), skeleton_data: str = Form(...)):
+async def talk(
+    file: UploadFile = File(...),
+    skeleton_data: str = Form("{}"),
+    camera_frame_b64: str = Form("")
+):
+    """
+    Main Loop: Receives Audio + Camera Frame -> Returns JSON with Audio + Landmarks.
+    """
+    cs = session.current_session
     temp_in = f"temp_{file.filename}"
     output = "response.mp3"
-    
+
     try:
-        # Save audio
-        with open(temp_in, "wb") as buffer: shutil.copyfileobj(file.file, buffer)
-        
-        # 1. Transcribe
-        with open(temp_in, "rb") as audio_file:
-            transcription = groq_client.audio.transcriptions.create(
-                file=(temp_in, audio_file.read()), model="whisper-large-v3-turbo", response_format="json", language="en"
-            )
-        user_text = transcription.text.strip()
-        print(f"🗣️ User: {user_text}")
-
-        # --- ECHO SAFETY CHECK ---
-        # If user text matches the last thing AI said, ignore it.
-        last_resp = current_session.get("last_response", "").lower()
-        if len(user_text) > 5 and (user_text.lower() in last_resp or last_resp in user_text.lower()):
-             print("⚠️ Echo detected. Ignoring.")
-             return JSONResponse(content={"status": "echo_ignored"}, status_code=200)
-
-        # 2. Movement Logic (Zero Lag)
-        rep_msg = analyze_movement(skeleton_data)
-        
-        headers = {
-            "X-Image-Cmd": "none", 
-            "X-Feedback": "", 
-            "X-Rep-Count": str(current_session["reps_session"])
+        response_data = {
+            "status": "ok",
+            "feedback": "",
+            "rep_count": cs["reps_count"],
+            "state": cs["state"],
+            "landmarks": "{}",
+            "audio_b64": "",
+            "form_status": cs.get("form_status", "neutral"),
+            "angle": round(cs.get("current_angle", 180), 1)
         }
 
-        # Priority A: Movement Feedback (Fastest)
-        if rep_msg:
-            print(f"🏋️ Coach: {rep_msg}")
-            headers["X-Feedback"] = rep_msg
-            if await generate_pro_voice(rep_msg, output):
-                return FileResponse(output, media_type="audio/mpeg", headers=headers)
+        # ============================================
+        # STEP 0: Process Camera Frame with MediaPipe
+        # ============================================
+        unity_landmarks = "{}"
+        if camera_frame_b64 and len(camera_frame_b64) > 100:
+            try:
+                frame_bytes = base64.b64decode(camera_frame_b64)
+                print(f"📷 Frame received: {len(frame_bytes)} bytes")
+                result = detect_pose_from_frame(frame_bytes)
+                if isinstance(result, tuple):
+                    skeleton_data, unity_landmarks = result
+                    if unity_landmarks != "{}":
+                        print(f"🦴 Detected pose! Landmarks: {len(unity_landmarks)} chars")
+                else:
+                    skeleton_data = result
+            except Exception as e:
+                print(f"⚠️ Frame decode error: {e}")
+        else:
+            if camera_frame_b64:
+                print(f"📷 Frame too small: {len(camera_frame_b64)} chars")
 
-        # Silent if no input and no movement
-        if len(user_text) < 2: 
-            return JSONResponse(content={"status": "silent"}, status_code=200)
+        response_data["landmarks"] = unity_landmarks
 
-        # Priority B: AI Conversation
-        ai_text, image_cmd = get_ai_decision(user_text, skeleton_data)
-        
-        # Store response for next echo check
-        current_session["last_response"] = ai_text 
-        
-        headers["X-Image-Cmd"] = image_cmd
-        headers["X-Feedback"] = "Listening..." # Clear feedback when chatting
+        # ============================================
+        # STEP 1: Check Audio (Skip dummy heartbeat files)
+        # ============================================
+        with open(temp_in, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
 
-        print(f"🤖 Dr. Kineti: {ai_text}")
-        
-        if await generate_pro_voice(ai_text, output):
-            return FileResponse(output, media_type="audio/mpeg", headers=headers)
-        
-        raise HTTPException(status_code=500, detail="Gen Failed")
+        file_size = os.path.getsize(temp_in)
+        user_text = ""
 
+        if file_size > MIN_AUDIO_SIZE_BYTES:
+            try:
+                with open(temp_in, "rb") as audio_file:
+                    transcription = config.groq_client.audio.transcriptions.create(
+                        file=(temp_in, audio_file.read()),
+                        model="whisper-large-v3-turbo",
+                        response_format="json",
+                        language="en"
+                    )
+                user_text = transcription.text.strip()
+            except Exception as e:
+                print(f"⚠️ Transcription error: {e}")
+                user_text = ""
+
+        # ============================================
+        # STEP 2: If user IS speaking, VOICE takes priority
+        # ============================================
+        if len(user_text) > 2 and not is_echo(user_text, cs["last_response"]):
+            print(f"🗣️ User: {user_text}")
+
+            if cs["state"] == "active_workout":
+                cs["paused_for_voice"] = True
+
+            ai_response = manage_conversation(user_text)
+
+            if ai_response:
+                cs["last_response"] = ai_response
+                print(f"🤖 Coach: {ai_response}")
+
+                await synthesize_speech(ai_response, output)
+
+                cs["paused_for_voice"] = False
+
+                with open(output, "rb") as f:
+                    response_data["audio_b64"] = base64.b64encode(f.read()).decode("utf-8")
+
+                response_data["feedback"] = ai_response
+                response_data["rep_count"] = cs["reps_count"]
+                response_data["state"] = cs["state"]
+                response_data["landmarks"] = unity_landmarks
+
+                return JSONResponse(content=response_data)
+            else:
+                cs["paused_for_voice"] = False
+
+        # ============================================
+        # STEP 3: If user is NOT speaking, process Vision
+        # ============================================
+        if not cs.get("paused_for_voice", False):
+            vision_feedback = process_vision_data(skeleton_data)
+
+            if vision_feedback:
+                response_data["feedback"] = vision_feedback
+                await synthesize_speech(vision_feedback, output)
+                with open(output, "rb") as f:
+                    response_data["audio_b64"] = base64.b64encode(f.read()).decode("utf-8")
+                response_data["landmarks"] = unity_landmarks
+                return JSONResponse(content=response_data)
+
+        # ============================================
+        # STEP 4: Silent response (still send landmarks!)
+        # ============================================
+        response_data["status"] = "silent"
+        response_data["landmarks"] = unity_landmarks
+        return JSONResponse(content=response_data)
+
+    except Exception as e:
+        print(f"❌ Server Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(content={"error": str(e), "landmarks": "{}"}, status_code=500)
     finally:
-        if os.path.exists(temp_in): os.remove(temp_in)
+        if os.path.exists(temp_in):
+            os.remove(temp_in)
 
-# Run with: python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
