@@ -214,8 +214,11 @@ async def speak(request: TextRequest):
     session.current_session["state"] = "check_in"
     text = f"Hello {user_name}! Dr. Kineti here. How are you feeling today?"
     session.current_session["last_response"] = text
-    await synthesize_speech(text, output)
-    return FileResponse(output, media_type="audio/mpeg", filename="greeting.mp3")
+    result = await synthesize_speech(text, output, language=session.current_session.get("language", "en-IN"))
+    if result and os.path.exists(output):
+        return FileResponse(output, media_type="audio/mpeg", filename="greeting.mp3")
+    else:
+        return JSONResponse(content={"error": "TTS failed", "text": text}, status_code=500)
 
 
 @app.post("/stop_workout")
@@ -231,18 +234,23 @@ async def stop_workout():
     cs["state"] = "finished_workout"
     cs["user_confirmed"] = False
     
-    # Save progress
-    from app.conversation import get_user_context
-    import json, os
+    # Save progress using centralized function
+    from app.conversation import get_user_context, save_user_data
+    from datetime import datetime
     user_data = get_user_context()
     user_data["reps_today"] = user_data.get("reps_today", 0) + reps
     user_data["last_exercise"] = exercise
-    try:
-        user_data_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "user_data.json")
-        with open(user_data_path, 'w') as f:
-            json.dump(user_data, f, indent=2)
-    except Exception as e:
-        print(f"⚠️ Failed to save user data on stop_workout: {e}")
+    
+    # Log to exercise history
+    history = user_data.get("exercise_history", [])
+    history.append({
+        "exercise": exercise,
+        "reps": reps,
+        "day": user_data.get("current_day", 1),
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")
+    })
+    user_data["exercise_history"] = history[-50:]
+    save_user_data(user_data)
 
     # Generate summary speech
     if reps > 0:
@@ -251,7 +259,7 @@ async def stop_workout():
         text = "Workout stopped. Take a breather, Swapnil. Let me know when you're ready to try again."
         
     cs["last_response"] = text
-    await synthesize_speech(text, output)
+    await synthesize_speech(text, output, language=cs.get("language", "en-IN"))
     
     import base64
     with open(output, "rb") as f:
@@ -340,6 +348,28 @@ async def talk(
         # STEP 2: If user IS speaking, VOICE takes priority
         # ============================================
         if len(user_text) > 2 and not is_echo(user_text, cs["last_response"]):
+            # Filter out common Whisper hallucination words (ambient noise, music, etc.)
+            noise_words = ["foreign", "music", "applause", "laughter", "silence", 
+                           "thank you for watching", "subscribe", "bye", "you", "but",
+                           "the", "a", "i", "it", "is", "oh", "um", "uh", "hmm",
+                           "hat", "what", "so", "no", "yeah", "okay"]
+            text_clean = user_text.lower().strip().rstrip(".")
+            
+            # Filter exact noise word matches
+            if text_clean in noise_words:
+                print(f"🔇 Filtered noise: '{user_text}'")
+                user_text = ""
+            
+            # Filter gibberish: if more than 60% of words are 1-2 characters, it's noise
+            elif len(text_clean) > 5:
+                words = text_clean.split()
+                if len(words) > 3:
+                    short_words = sum(1 for w in words if len(w) <= 2)
+                    if short_words / len(words) > 0.6:
+                        print(f"🔇 Filtered gibberish ({short_words}/{len(words)} short words): '{user_text}'")
+                        user_text = ""
+            
+        if len(user_text) > 2:
             print(f"🗣️ User: {user_text}")
 
             if cs["state"] == "active_workout":
@@ -351,12 +381,13 @@ async def talk(
                 cs["last_response"] = ai_response
                 print(f"🤖 Coach: {ai_response}")
 
-                await synthesize_speech(ai_response, output)
+                result = await synthesize_speech(ai_response, output, language=cs.get("language", "en-IN"))
 
                 cs["paused_for_voice"] = False
 
-                with open(output, "rb") as f:
-                    response_data["audio_b64"] = base64.b64encode(f.read()).decode("utf-8")
+                if result and os.path.exists(output):
+                    with open(output, "rb") as f:
+                        response_data["audio_b64"] = base64.b64encode(f.read()).decode("utf-8")
 
                 response_data["feedback"] = ai_response
                 response_data["rep_count"] = cs["reps_count"]
@@ -375,9 +406,10 @@ async def talk(
 
             if vision_feedback:
                 response_data["feedback"] = vision_feedback
-                await synthesize_speech(vision_feedback, output)
-                with open(output, "rb") as f:
-                    response_data["audio_b64"] = base64.b64encode(f.read()).decode("utf-8")
+                result = await synthesize_speech(vision_feedback, output, language=cs.get("language", "en-IN"))
+                if result and os.path.exists(output):
+                    with open(output, "rb") as f:
+                        response_data["audio_b64"] = base64.b64encode(f.read()).decode("utf-8")
                 response_data["landmarks"] = unity_landmarks
                 return JSONResponse(content=response_data)
 

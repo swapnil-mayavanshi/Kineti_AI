@@ -1,6 +1,8 @@
 {
-  "user_name": "Mr. Swapnil",
-  "current_day": 1,
+  "user_name": "Swapnil",
+  "current_day": 2,
   "reps_today": 0,
-  "last_exercise": "none"
+  "last_exercise": "Squat",
+  "last_date": "2026-03-11",
+  "exercise_history": []
 }

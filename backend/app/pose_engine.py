@@ -23,6 +23,19 @@ _frame_count = 0  # For reducing log spam
 _video_timestamp_ms = 0  # Monotonic timestamp for VIDEO mode
 _warmup_frames = 3  # Skip form analysis for first N frames (VIDEO mode warmup)
 
+# --- Debounce State (no heavy smoothing — just consecutive-frame filtering) ---
+_down_consecutive = 0        # Consecutive frames in squat-down position
+_up_consecutive = 0          # Consecutive frames in standing position
+_MIN_DOWN_FRAMES = 2         # Must be down for 2+ consecutive frames to register squat
+_MIN_UP_FRAMES = 3           # Must be standing for 3+ consecutive frames to count rep (prevents flicker)
+
+
+def reset_angle_tracking():
+    """Reset debounce state when workout starts/stops."""
+    global _down_consecutive, _up_consecutive
+    _down_consecutive = 0
+    _up_consecutive = 0
+
 
 def init_mediapipe():
     """Initialize MediaPipe pose detector using Tasks API."""
@@ -222,7 +235,11 @@ def analyze_squat_form(joints):
         # Calculate both knee angles
         r_angle = calculate_angle(joints['RightHip'], joints['RightKnee'], joints['RightAnkle'])
         l_angle = calculate_angle(joints['LeftHip'], joints['LeftKnee'], joints['LeftAnkle'])
-        knee_angle = (r_angle + l_angle) / 2.0  # Average
+        
+        # Use AVERAGE of both knees. When viewing from the side, the far leg
+        # often reads incorrectly. Average + 2-frame debounce gives the best
+        # balance between catching real squats and filtering glitches.
+        knee_angle = (r_angle + l_angle) / 2.0
 
         # DEBUG: Print every frame so we can see the angles
         global _frame_count
@@ -244,9 +261,9 @@ def analyze_squat_form(joints):
 def process_vision_data(skeleton_json):
     """
     Analyzes skeleton data for exercise form and rep counting.
-    ONLY gives feedback/counts reps when in active_workout state (user confirmed via voice).
-    Always calculates angles for debug display regardless of state.
+    Uses debounced state transitions to prevent phantom reps from flickering angles.
     """
+    global _down_consecutive, _up_consecutive
     cs = session.current_session
 
     # Guard: skip if paused for voice (user is talking to AI)
@@ -267,7 +284,7 @@ def process_vision_data(skeleton_json):
 
         # DEBUG: Log state every 3rd frame
         if _frame_count % 3 == 0:
-            print(f"📊 state={cs['state']} form={form_status} angle={knee_angle:.1f}° is_moving={cs['is_moving']} reps={cs['reps_count']}")
+            print(f"📊 state={cs['state']} form={form_status} angle={knee_angle:.1f}° is_moving={cs['is_moving']} reps={cs['reps_count']} down_frames={_down_consecutive} up_frames={_up_consecutive}")
 
         # GUARD: Skip form analysis during warmup (VIDEO mode gives bad angles on first frames)
         if _frame_count <= _warmup_frames:
@@ -279,27 +296,59 @@ def process_vision_data(skeleton_json):
         if cs["state"] != "active_workout":
             return None
 
-        # Rep Counting Logic
-        if form_status == "good":
-            if not cs["is_moving"]:
+        # ---------- DEBOUNCED Rep Counting Logic ----------
+        # Phase 1: Detect SQUAT DOWN — angle must go below SQUAT_GOOD_DEPTH for _MIN_DOWN_FRAMES
+        # Phase 2: Detect STANDING UP — angle must go above SQUAT_PARTIAL_DEPTH for _MIN_UP_FRAMES
+        # This counts as one complete rep.
+        
+        is_deep_squat = knee_angle < SQUAT_GOOD_DEPTH        # Below 100° = full squat
+        is_rising = knee_angle > SQUAT_PARTIAL_DEPTH          # Above 130° = coming back up
+        
+        if is_deep_squat:
+            # User is in deep squat position
+            _down_consecutive += 1
+            _up_consecutive = 0  # Reset standing counter
+            
+            if not cs["is_moving"] and _down_consecutive >= _MIN_DOWN_FRAMES:
                 cs["is_moving"] = True
-                print(f"⬇️ SQUAT DOWN detected! angle={knee_angle:.1f}°")
-                return "Good depth! Hold it."
-        elif form_status == "bad":
-            if not cs["is_moving"]:
-                return form_tip  # "Go deeper!"
-        else:  # neutral = standing
-            if cs["is_moving"] and knee_angle > SQUAT_STANDING:
-                cs["is_moving"] = False
-                cs["reps_count"] += 1
-                count = cs['reps_count']
-                print(f"⬆️ REP {count} COUNTED! angle={knee_angle:.1f}°")
-                if count == 5:
-                    return f"{count}! Halfway there, you're doing great!"
-                elif count == cs['target_reps']:
-                    return f"{count}! Amazing work, you completed your set!"
-                else:
-                    return f"Rep {count}. Keep going!"
+                print(f"⬇️ SQUAT DOWN confirmed! angle={knee_angle:.1f}° (held for {_down_consecutive} frames)")
+                from app.conversation import _msg
+                return _msg("good_depth")
+        
+        elif is_rising:
+            # User is standing back up (angle above partial depth)
+            if cs["is_moving"]:
+                # Only count up frames when user WAS in a squat
+                _up_consecutive += 1
+                _down_consecutive = 0
+                
+                if _up_consecutive >= _MIN_UP_FRAMES:
+                    # REP COMPLETE!
+                    cs["is_moving"] = False
+                    cs["reps_count"] += 1
+                    count = cs['reps_count']
+                    print(f"⬆️ REP {count} COUNTED! angle={knee_angle:.1f}° (stood for {_up_consecutive} frames)")
+                    _up_consecutive = 0
+                    from app.conversation import _msg
+                    if count == 5:
+                        return _msg("halfway", count=count)
+                    elif count == cs['target_reps']:
+                        return _msg("set_complete", count=count)
+                    else:
+                        return _msg("rep_count", count=count)
+            else:
+                # Not squatting, just standing normally
+                _down_consecutive = 0
+                _up_consecutive = 0
+        
+        else:
+            # In between (100° to 130°) — transitional zone
+            # Don't reset counters — allow smooth transition through this zone
+            if not cs["is_moving"] and _down_consecutive == 0:
+                # User hasn't squatted yet and is in partial zone
+                from app.conversation import _msg
+                return _msg("go_deeper")
+                
     except Exception as e:
         print(f"⚠️ Vision processing error: {e}")
         import traceback

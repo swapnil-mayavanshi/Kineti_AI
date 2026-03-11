@@ -39,12 +39,12 @@ LANDMARK_MAP = {
 
 # --- Squat Thresholds (degrees) ---
 # User's body: standing ~160°, deep squat ~92°
-SQUAT_GOOD_DEPTH = 120      # Below this = good squat
-SQUAT_PARTIAL_DEPTH = 145   # Between 120-145 = needs to go deeper
-SQUAT_STANDING = 155        # Above this = standing (rep complete)
+SQUAT_GOOD_DEPTH = 100      # Below this = good squat (tight to prevent normal bending from triggering)
+SQUAT_PARTIAL_DEPTH = 130   # Between 100-130 = needs to go deeper
+SQUAT_STANDING = 145        # Above this = standing (balanced: catches phone cameras, rejects normal movement)
 
 # --- Echo Suppression ---
-ECHO_SIMILARITY_THRESHOLD = 0.35  # Lowered from 0.5 to catch AI-echo mixtures
+ECHO_SIMILARITY_THRESHOLD = 0.55  # Increased to prevent false positives
 
 # --- Minimum Audio Size ---
 MIN_AUDIO_SIZE_BYTES = 1000  # Only transcribe files > 1KB
